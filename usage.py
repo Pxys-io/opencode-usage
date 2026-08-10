@@ -275,6 +275,7 @@ def save_cache(rows):
 
 
 def normalize(r):
+    cache_write = (r.get("cacheWrite5mTokens") or 0) + (r.get("cacheWrite1hTokens") or 0)
     return {
         "id": r["id"],
         "time": parse_dt(r["timeCreated"]),
@@ -282,13 +283,11 @@ def normalize(r):
         "provider": r["provider"],
         "session": (r.get("sessionID") or "").split("_")[-1],
         "key": r.get("keyID") or "",
-        "input": (r.get("inputTokens") or 0)
-        + (r.get("cacheReadTokens") or 0)
-        + (r.get("cacheWrite5mTokens") or 0)
-        + (r.get("cacheWrite1hTokens") or 0),
+        "input": (r.get("inputTokens") or 0) + cache_write,
+        "cache_write": cache_write,
+        "cache_read": r.get("cacheReadTokens") or 0,
         "output": r.get("outputTokens") or 0,
         "reasoning": r.get("reasoningTokens") or 0,
-        "cache_read": r.get("cacheReadTokens") or 0,
         "cost": (r.get("cost") or 0) / PER_USD,
     }
 
@@ -420,199 +419,120 @@ def main():
         return
 
     if args.command == "requests":
-        header = ["Date", "Model", "Input", "Output", "Cost", "Session"]
+        header = ["Date", "Model", "Type", "Input", "Cache", "Output", "Cost", "Session"]
         table = [
             [
                 fmt_time(r["time"]),
                 r["model"],
+                "billed" if r["cost"] > 0 else "free",
                 fmt_num(r["input"]),
+                fmt_num(r["cache_read"]),
                 fmt_num(r["output"]),
                 money(r["cost"]),
                 r["session"],
             ]
-            for r in recs
+            for r in recs[: args.top]
         ]
         print_table(header, table, args.json)
         return
 
-    totals = {
-        "requests": len(recs),
-        "cost": sum(r["cost"] for r in recs),
-        "input": sum(r["input"] for r in recs),
-        "output": sum(r["output"] for r in recs),
-        "reasoning": sum(r["reasoning"] for r in recs),
-        "cache_read": sum(r["cache_read"] for r in recs),
-    }
+    def build_row(key, g):
+        n = len(g)
+        inp = sum(x["input"] for x in g)
+        cr = sum(x["cache_read"] for x in g)
+        billed = sum(1 for x in g if x["cost"] > 0)
+        return {
+            "key": key,
+            "requests": n,
+            "billed": billed,
+            "free": n - billed,
+            "input": inp,
+            "cache": cr,
+            "output": sum(x["output"] for x in g),
+            "reasoning": sum(x["reasoning"] for x in g),
+            "cost": sum(x["cost"] for x in g),
+            "hit": (cr / (inp + cr) * 100) if inp + cr else 0.0,
+        }
 
     def aggregate(key):
         groups = defaultdict(list)
         for r in recs:
             groups[r[key]].append(r)
-        out = []
-        for k, g in groups.items():
-            out.append(
-                {
-                    "key": k,
-                    "requests": len(g),
-                    "cost": sum(x["cost"] for x in g),
-                    "input": sum(x["input"] for x in g),
-                    "output": sum(x["output"] for x in g),
-                }
-            )
+        out = [build_row(k, g) for k, g in groups.items()]
         out.sort(key=lambda x: x["cost"], reverse=True)
         return out
 
+    def render(first_col, rows, json_out):
+        header = [first_col, "Requests", "Billed", "Free", "Input", "Cache",
+                  "Output", "Hit%", "Cost"]
+        table = [
+            [
+                r["key"],
+                fmt_num(r["requests"]),
+                fmt_num(r["billed"]),
+                fmt_num(r["free"]),
+                fmt_num(r["input"]),
+                fmt_num(r["cache"]),
+                fmt_num(r["output"]),
+                f"{r['hit']:.1f}%",
+                money(r["cost"]),
+            ]
+            for r in rows
+        ]
+        print_table(header, table, json_out)
+
+    totals = build_row("overall", recs)
     by_model = aggregate("model")
     by_day = defaultdict(list)
     for r in recs:
         by_day[r["time"].astimezone().date()].append(r)
-    days = []
-    for d, g in sorted(by_day.items(), key=lambda kv: kv[0], reverse=True):
-        days.append(
-            {
-                "key": str(d),
-                "requests": len(g),
-                "cost": sum(x["cost"] for x in g),
-                "input": sum(x["input"] for x in g),
-                "output": sum(x["output"] for x in g),
-            }
-        )
+    days = [
+        build_row(str(d), g)
+        for d, g in sorted(by_day.items(), key=lambda kv: kv[0], reverse=True)
+    ]
 
     if args.command == "summary":
         print("==", "OVERALL", "==")
-        print(f"  requests : {fmt_num(totals['requests'])}")
+        print(f"  requests : {fmt_num(totals['requests'])}  (billed {fmt_num(totals['billed'])} / free {fmt_num(totals['free'])})")
         print(f"  cost     : {money(totals['cost'])}")
-        print(f"  input    : {fmt_num(totals['input'])} tokens (incl cache)")
+        print(f"  input    : {fmt_num(totals['input'])} tokens (not from cache)")
+        print(f"  cache    : {fmt_num(totals['cache'])} tokens read  (hit rate {totals['hit']:.1f}%)")
         print(f"  output   : {fmt_num(totals['output'])} tokens")
         print(f"  reasoning: {fmt_num(totals['reasoning'])} tokens")
-        print(f"  cache    : {fmt_num(totals['cache_read'])} tokens read")
         print()
         print("==", "PER DAY", "==")
-        print_table(
-            ["Date", "Requests", "Input", "Output", "Cost"],
-            [
-                [
-                    d["key"],
-                    fmt_num(d["requests"]),
-                    fmt_num(d["input"]),
-                    fmt_num(d["output"]),
-                    money(d["cost"]),
-                ]
-                for d in days[: args.top]
-            ],
-            args.json,
-        )
+        render("Date", days[: args.top], args.json)
         print()
         print("==", "PER MODEL", "==")
-        print_table(
-            ["Model", "Requests", "Input", "Output", "Cost"],
-            [
-                [
-                    m["key"],
-                    fmt_num(m["requests"]),
-                    fmt_num(m["input"]),
-                    fmt_num(m["output"]),
-                    money(m["cost"]),
-                ]
-                for m in by_model
-            ],
-            args.json,
-        )
+        render("Model", by_model, args.json)
         return
 
     if args.command == "sessions":
-        table = [
-            [
-                s["key"],
-                fmt_num(s["requests"]),
-                fmt_num(s["input"]),
-                fmt_num(s["output"]),
-                money(s["cost"]),
-            ]
-            for s in aggregate("session")
-        ]
-        print_table(
-            ["Session", "Requests", "Input", "Output", "Cost"], table, args.json
-        )
+        render("Session", aggregate("session"), args.json)
         return
 
     if args.command == "models":
-        table = [
-            [
-                m["key"],
-                fmt_num(m["requests"]),
-                fmt_num(m["input"]),
-                fmt_num(m["output"]),
-                money(m["cost"]),
-            ]
-            for m in by_model
-        ]
-        print_table(["Model", "Requests", "Input", "Output", "Cost"], table, args.json)
+        render("Model", by_model, args.json)
         return
 
     if args.command == "providers":
-        table = [
-            [
-                p["key"],
-                fmt_num(p["requests"]),
-                fmt_num(p["input"]),
-                fmt_num(p["output"]),
-                money(p["cost"]),
-            ]
-            for p in aggregate("provider")
-        ]
-        print_table(
-            ["Provider", "Requests", "Input", "Output", "Cost"], table, args.json
-        )
+        render("Provider", aggregate("provider"), args.json)
         return
 
     if args.command == "days":
-        print_table(
-            ["Date", "Requests", "Input", "Output", "Cost"],
-            [
-                [
-                    d["key"],
-                    fmt_num(d["requests"]),
-                    fmt_num(d["input"]),
-                    fmt_num(d["output"]),
-                    money(d["cost"]),
-                ]
-                for d in days
-            ],
-            args.json,
-        )
+        render("Date", days, args.json)
         return
 
     if args.command == "hours":
         by_hour = defaultdict(list)
         for r in recs:
             by_hour[r["time"].astimezone().strftime("%Y-%m-%d %H:00")].append(r)
-        table = []
-        for h, g in sorted(by_hour.items(), reverse=True):
-            table.append(
-                [
-                    h,
-                    fmt_num(len(g)),
-                    fmt_num(sum(x["input"] for x in g)),
-                    fmt_num(sum(x["output"] for x in g)),
-                    money(sum(x["cost"] for x in g)),
-                ]
-            )
-        print_table(["Hour", "Requests", "Input", "Output", "Cost"], table, args.json)
+        hours = [build_row(h, g) for h, g in sorted(by_hour.items(), reverse=True)]
+        render("Hour", hours, args.json)
         return
 
     if args.command == "keys":
-        table = [
-            [
-                k["key"],
-                fmt_num(k["requests"]),
-                fmt_num(k["input"]),
-                fmt_num(k["output"]),
-                money(k["cost"]),
-            ]
-            for k in aggregate("key")
-        ]
-        print_table(["Key", "Requests", "Input", "Output", "Cost"], table, args.json)
+        render("Key", aggregate("key"), args.json)
         return
 
 
