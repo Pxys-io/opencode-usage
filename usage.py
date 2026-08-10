@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import concurrent.futures
 import json
 import os
 import sys
@@ -212,19 +213,42 @@ def parse_dt(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def fetch_all(workspace, auth, max_pages, since_dt):
+def fetch_all(workspace, auth, max_pages, since_dt, workers=16):
     seen = {}
-    for page in range(max_pages + 1):
-        recs = request_page(page, workspace, auth)
-        for r in recs:
-            seen[r["id"]] = r
-        if page and page % 25 == 0:
-            print(f"  ...page {page}, {len(seen):,} requests", file=sys.stderr)
-        if not recs or len(recs) < 50:
+    start = 0
+    while start <= max_pages:
+        end = min(start + workers, max_pages + 1)
+        pages = list(range(start, end))
+        results = {}
+        pending = pages[:]
+        for attempt in range(3):
+            if not pending:
+                break
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = {ex.submit(request_page, p, workspace, auth): p for p in pending}
+                for fut in concurrent.futures.as_completed(futures):
+                    p = futures[fut]
+                    try:
+                        results[p] = fut.result()
+                    except Exception:
+                        results[p] = None
+            pending = [p for p in pages if results.get(p) is None]
+        done = False
+        for p in pages:
+            recs = results.get(p)
+            if not recs:
+                continue
+            for r in recs:
+                seen[r["id"]] = r
+            if len(recs) < 50:
+                done = True
+            if since_dt is not None and parse_dt(recs[-1]["timeCreated"]) < since_dt:
+                done = True
+        if start and start % 200 == 0:
+            print(f"  ...page {start}, {len(seen):,} requests", file=sys.stderr)
+        if done or end > max_pages:
             break
-        if since_dt is not None and parse_dt(recs[-1]["timeCreated"]) < since_dt:
-            break
-        time.sleep(0.1)
+        start = end
     return list(seen.values())
 
 
@@ -330,6 +354,7 @@ def main():
     ap.add_argument("--provider", default=None, help="filter by provider")
     ap.add_argument("--top", type=int, default=20, help="limit for list views")
     ap.add_argument("--max-pages", type=int, default=100000, help="max pages to fetch")
+    ap.add_argument("--workers", type=int, default=16, help="concurrent page requests")
     ap.add_argument(
         "--workspace", default=os.environ.get("OC_WORKSPACE", DEFAULT_WORKSPACE)
     )
@@ -366,7 +391,8 @@ def main():
     if rows is None:
         print("fetching usage history...", file=sys.stderr)
         try:
-            rows = fetch_all(args.workspace, auth, args.max_pages, since_dt)
+            rows = fetch_all(args.workspace, auth, args.max_pages, since_dt,
+                             workers=args.workers)
             save_cache(rows)
         except RuntimeError as e:
             print(f"error: {e}", file=sys.stderr)
