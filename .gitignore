@@ -1,0 +1,4 @@
+auth.txt
+.auth
+__pycache__/
+*.pyc
